@@ -1,4 +1,4 @@
-const CACHE_NAME = 'dlms-xta-v7';
+const CACHE_NAME = 'dlms-xta-v8';
 const FILES_TO_CACHE = ['./', './index.html', './manifest.json'];
 
 self.addEventListener('install', (e) => {

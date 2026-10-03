@@ -159,6 +159,19 @@
     transition:transform .25s ease; z-index:50; box-shadow:0 8px 24px rgba(0,0,0,.5); font-family:var(--mono);}
   #toast.show{transform:translateX(-50%) translateY(0);}
 
+  /* ---------- PENGATURAN / PIN / LOGO ---------- */
+  input.txt, select.sel{width:100%; background:var(--panel2); border:1px solid var(--line); color:var(--text);
+    font-family:var(--mono); font-size:14px; padding:10px; border-radius:8px; user-select:text;}
+  input.txt{letter-spacing:.3em; text-align:center;}
+  .row2{display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px;}
+  .logoprev{background:#000; border-radius:8px; border:1px solid var(--line); padding:6px; margin-top:10px;}
+  .logoprev canvas{image-rendering:pixelated; border-radius:4px;}
+  .pbar{height:6px; background:#060a12; border-radius:4px; overflow:hidden; margin-top:10px; border:1px solid var(--line);}
+  .pbar i{display:block; height:100%; width:0; background:var(--cyan); transition:width .15s;}
+  .modal{position:fixed; inset:0; background:rgba(4,7,12,.82); display:none; align-items:center; justify-content:center; z-index:80; padding:20px;}
+  .modal.show{display:flex;}
+  .modal .box{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; width:100%; max-width:340px;}
+  .modal .msg{font-size:11px; line-height:1.6; color:var(--text); margin-bottom:12px; text-transform:none; letter-spacing:0;}
   .hint{font-size:10px; color:var(--textdim); line-height:1.6; padding:4px 2px 0; text-transform:none; letter-spacing:0;}
 </style>
 </head>
@@ -192,12 +205,19 @@
     <button data-tab="comp">COMPRESSOR</button>
     <button data-tab="rta">LEVEL METER</button>
     <button data-tab="preset">PRESET</button>
+    <button data-tab="settings">PENGATURAN</button>
   </nav>
 
   <main id="main"></main>
 </div>
 
 <div id="toast"></div>
+
+<div id="pinModal" class="modal"><div class="box">
+  <div class="msg" id="pinMsg"></div>
+  <input class="txt" id="pinModalInp" type="password" inputmode="numeric" maxlength="6" placeholder="------" autocomplete="off">
+  <div class="row2"><button class="btn" id="pinCancel">BATAL</button><button class="btn primary" id="pinOk">MASUK</button></div>
+</div></div>
 
 <script>
 /* ============================================================
@@ -207,6 +227,8 @@ const SERVICE_UUID   = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const CHAR_CONTROL    = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
 const CHAR_STATUS     = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
 const CHAR_RTA        = 'beb5483e-36e1-4688-b7f5-ea07361b26aa';
+const CHAR_LOGO       = 'beb5483e-36e1-4688-b7f5-ea07361b26ab'; // ganti logo layar (firmware baru)
+const CMD_AUTH        = 0x20;   // [0x20, 6 digit PIN ASCII] - dipakai kalau PIN Bluetooth diaktifkan di alat
 
 const CMD = {
   SET_ROUTE:0x01, SET_GAIN:0x02, SET_MUTE:0x03, SET_XOVER_HPF:0x04, SET_XOVER_LPF:0x05,
@@ -214,7 +236,7 @@ const CMD = {
   GET_ALL_STATUS:0x0B
 };
 
-let device=null, controlChar=null, connected=false;
+let device=null, controlChar=null, logoChar=null, connected=false, authed=false, statusSeen=false, hasStatusChar=false;
 let activeCh = 0;
 let activeBand = 0;
 
@@ -237,22 +259,63 @@ const state = {
 };
 
 /* ---------------- BLE CONNECTION ---------------- */
+const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+const pinAscii = (pin)=>Array.from(pin).map(c=>c.charCodeAt(0));
+
+async function writeRaw(ch, arr, withResponse){
+  const buf = new Uint8Array(arr);
+  if(withResponse){
+    try{ if(ch.writeValueWithResponse) await ch.writeValueWithResponse(buf); else await ch.writeValue(buf); return; }
+    catch(e){ await ch.writeValueWithoutResponse(buf); return; }
+  }
+  try{ await ch.writeValueWithoutResponse(buf); }
+  catch(e){ await ch.writeValue(buf); }
+}
+
+function askPin(msg){
+  return new Promise((resolve)=>{
+    const m=document.getElementById('pinModal'), inp=document.getElementById('pinModalInp');
+    const okB=document.getElementById('pinOk'), cancelB=document.getElementById('pinCancel');
+    document.getElementById('pinMsg').textContent = msg;
+    inp.value=''; m.classList.add('show'); setTimeout(()=>inp.focus(),50);
+    const done=(v)=>{ m.classList.remove('show'); okB.onclick=cancelB.onclick=null; resolve(v); };
+    okB.onclick=()=>{ const v=inp.value.trim(); if(!/^\d{6}$/.test(v)){ toast('PIN harus 6 angka'); return; } done(v); };
+    cancelB.onclick=()=>done(null);
+  });
+}
+
+// Alat membalas GET_ALL_STATUS hanya kalau akses diizinkan (PIN mati / sudah AUTH)
+async function probeAccess(){
+  statusSeen=false;
+  await writeRaw(controlChar,[CMD.GET_ALL_STATUS]);
+  for(let i=0;i<20 && !statusSeen;i++) await sleep(100);
+  return statusSeen;
+}
+async function authenticate(pin){
+  await writeRaw(controlChar,[CMD_AUTH, ...pinAscii(pin)]);
+  await sleep(150);
+  return probeAccess();
+}
+
 async function connectBLE(){
   if(!navigator.bluetooth){ toast('Web Bluetooth tidak didukung — buka di Chrome Android'); return; }
   try{
     device = await navigator.bluetooth.requestDevice({
-      filters:[{ namePrefix:'DLMS' }],
+      // cari lewat service UUID (tetap ketemu walau nama Bluetooth diganti), nama "DLMS" tetap diterima
+      filters:[{ services:[SERVICE_UUID] }, { namePrefix:'DLMS' }],
       optionalServices:[SERVICE_UUID]
     });
     device.addEventListener('gattserverdisconnected', onDisconnected);
     const server = await device.gatt.connect();
     const service = await server.getPrimaryService(SERVICE_UUID);
     controlChar = await service.getCharacteristic(CHAR_CONTROL);
+    logoChar = null; hasStatusChar = false; authed = false;
 
     try{
       const statusChar = await service.getCharacteristic(CHAR_STATUS);
       await statusChar.startNotifications();
       statusChar.addEventListener('characteristicvaluechanged', onStatusNotify);
+      hasStatusChar = true;
     }catch(e){}
 
     try{
@@ -261,24 +324,43 @@ async function connectBLE(){
       rtaChar.addEventListener('characteristicvaluechanged', onRtaNotify);
     }catch(e){}
 
+    try{ logoChar = await service.getCharacteristic(CHAR_LOGO); }catch(e){ logoChar = null; }
+
     connected = true;
     updateConnUI();
-    toast('Terhubung ke board');
-    sendCmd(CMD.GET_ALL_STATUS, []);
+
+    // --- cek akses / PIN ---
+    const saved = localStorage.getItem('dlms_pin');
+    if(saved && hasStatusChar) await writeRaw(controlChar,[CMD_AUTH, ...pinAscii(saved)]);
+    let ok = hasStatusChar ? await probeAccess() : true;
+    let msg = 'Alat ini dilindungi PIN Bluetooth. Masukkan 6 angka PIN.';
+    if(saved && !ok) msg = 'PIN tersimpan salah atau alat terkunci 30 detik. Masukkan PIN lagi.';
+    while(!ok){
+      const pin = await askPin(msg);
+      if(pin===null || !connected) break;
+      ok = await authenticate(pin);
+      if(ok) localStorage.setItem('dlms_pin', pin);
+      else msg = 'PIN salah (5x salah = terkunci 30 detik). Coba lagi.';
+    }
+    authed = ok;
+    updateConnUI();
+    toast(authed ? 'Terhubung ke board' : 'Terhubung, tapi terkunci PIN');
+    if(authed) sendCmd(CMD.GET_ALL_STATUS, []);
   }catch(e){
     toast('Gagal connect: ' + e.message);
   }
 }
-function onDisconnected(){ connected=false; updateConnUI(); toast('Terputus dari board'); }
+function onDisconnected(){ connected=false; authed=false; logoChar=null; updateConnUI(); toast('Terputus dari board'); }
 function updateConnUI(){
   const btn=document.getElementById('connBtn');
   const lbl=document.getElementById('connLabel');
-  btn.classList.toggle('on', connected);
-  lbl.textContent = connected ? 'SYNCED' : 'CONNECT';
+  btn.classList.toggle('on', connected && authed);
+  lbl.textContent = connected ? (authed ? 'SYNCED' : 'LOCKED') : 'CONNECT';
 }
 
 async function sendCmd(cmd, payloadArr){
   if(!connected || !controlChar){ toast('Belum terhubung ke board'); return; }
+  if(!authed){ toast('Alat terkunci PIN — buka tab PENGATURAN'); return; }
   const buf = new Uint8Array([cmd, ...payloadArr]);
   try{ await controlChar.writeValueWithoutResponse(buf); }
   catch(e){ try{ await controlChar.writeValue(buf); }catch(e2){ toast('Gagal kirim data'); } }
@@ -286,7 +368,24 @@ async function sendCmd(cmd, payloadArr){
 function i16le(v){ const b=new ArrayBuffer(2); new DataView(b).setInt16(0,v,true); return Array.from(new Uint8Array(b)); }
 function u16le(v){ const b=new ArrayBuffer(2); new DataView(b).setUint16(0,v,true); return Array.from(new Uint8Array(b)); }
 
-function onStatusNotify(e){ render(); renderOverviewCards(); }
+function onStatusNotify(e){
+  statusSeen = true;
+  const dv = e.target.value;
+  // format dari firmware: route[4] u8, gain[4] i16, hpf[4] u16, lpf[4] u16, muteMask u8 = 29 byte
+  if(dv && dv.byteLength >= 29){
+    let p = 0;
+    for(let ch=0; ch<4; ch++) state.route[ch] = dv.getUint8(p++);
+    for(let ch=0; ch<4; ch++){ state.gain[ch] = dv.getInt16(p,true); p+=2; }
+    for(let ch=0; ch<4; ch++){ state.xoverHpf[ch] = dv.getUint16(p,true); p+=2; }
+    for(let ch=0; ch<4; ch++){ state.xoverLpf[ch] = dv.getUint16(p,true); p+=2; }
+    const mask = dv.getUint8(p);
+    for(let ch=0; ch<4; ch++) state.mute[ch+2] = !!(mask & (1<<(ch+2)));
+  }
+  if(currentTab!=='settings') render();
+  renderOverviewCards();
+}
+// minta status terbaru dari alat (mis. setelah LOAD preset)
+function refreshStatusSoon(){ setTimeout(()=>{ if(connected && authed) sendCmd(CMD.GET_ALL_STATUS, []); }, 500); }
 
 let meterVals = new Array(6).fill(0); // IN-L, IN-R, OUT1-4, skala 0-255
 function onRtaNotify(e){
@@ -365,7 +464,7 @@ function fillPresetQuickSel(){
 }
 document.getElementById('quickLoadBtn').addEventListener('click', ()=>{
   const slot = +document.getElementById('presetQuickSel').value;
-  sendCmd(CMD.LOAD_PRESET,[slot]); toast('Memuat '+state.presets[slot]);
+  sendCmd(CMD.LOAD_PRESET,[slot]); toast('Memuat '+state.presets[slot]); refreshStatusSoon();
 });
 document.getElementById('quickSaveBtn').addEventListener('click', ()=>{
   const slot = +document.getElementById('presetQuickSel').value;
@@ -396,6 +495,7 @@ function render(){
   else if(currentTab==='comp') renderComp();
   else if(currentTab==='rta') renderRta();
   else if(currentTab==='preset') renderPreset();
+  else if(currentTab==='settings') renderSettings();
 }
 
 function renderMatrix(){
@@ -427,7 +527,7 @@ function renderXover(){
       <div class="faderstrip">
         <div class="fadercol">
           <div class="flabel">GAIN</div>
-          <div class="fadertrack"><input type="range" class="vslider" orient="vertical" min="-24" max="24" step="1" value="${gain}" id="gainSlider"></div>
+          <div class="fadertrack"><input type="range" class="vslider" orient="vertical" min="-40" max="6" step="1" value="${gain}" id="gainSlider"></div>
           <div class="fval" id="gainVal">${gain>0?'+':''}${gain}dB</div>
         </div>
         <div class="fadercol">
@@ -688,11 +788,106 @@ function renderPreset(){
     <p class="hint">Nama preset di atas masih placeholder (belum bisa diketik/tersimpan) — menyimpan konfigurasi lengkap channel aktif tetap berfungsi penuh.</p></div>`;
   main.innerHTML = html;
   main.querySelectorAll('[data-load]').forEach(b=>{
-    b.addEventListener('click', ()=>{ sendCmd(CMD.LOAD_PRESET,[+b.dataset.load]); toast('Memuat '+state.presets[+b.dataset.load]); });
+    b.addEventListener('click', ()=>{ sendCmd(CMD.LOAD_PRESET,[+b.dataset.load]); toast('Memuat '+state.presets[+b.dataset.load]); refreshStatusSoon(); });
   });
   main.querySelectorAll('[data-save]').forEach(b=>{
     b.addEventListener('click', ()=>{ sendCmd(CMD.SAVE_PRESET,[+b.dataset.save]); toast('Tersimpan ke slot '+(+b.dataset.save+1)); });
   });
+}
+
+/* ---------------- PENGATURAN: GANTI LOGO + PIN ---------------- */
+const LOGO_W=160, LOGO_H=128;
+let logoImg=null, logoBusy=false;
+
+function renderSettings(){
+  const savedPin = !!localStorage.getItem('dlms_pin');
+  main.innerHTML = `
+  <div class="panel"><h3>Ganti Logo Layar (Booting &amp; Standby)</h3>
+    <input type="file" id="logoFile" accept="image/*" class="sel">
+    <div style="height:8px"></div>
+    <select id="logoMode" class="sel"><option value="fit">PAS (UTUH, TEPI HITAM)</option><option value="fill">PENUH (TEPI DIPOTONG)</option></select>
+    <div class="logoprev"><canvas id="logoCanvas" width="${LOGO_W}" height="${LOGO_H}"></canvas></div>
+    <div class="pbar"><i id="logoBar"></i></div>
+    <div class="row2">
+      <button class="btn primary" id="logoSend">KIRIM KE ALAT</button>
+      <button class="btn" id="logoReset">LOGO BAWAAN</button>
+    </div>
+    <p class="hint" id="logoStat">Pilih gambar apa saja, otomatis diubah ke 160x128. Alat harus terhubung dan tidak terkunci PIN. Kirim butuh sekitar 15-30 detik; audio bisa putus sesaat saat logo disimpan ke flash.</p>
+  </div>
+  <div class="panel"><h3>PIN Bluetooth</h3>
+    <input class="txt" id="pinInp" type="password" inputmode="numeric" maxlength="6" placeholder="------" autocomplete="off">
+    <div class="row2">
+      <button class="btn primary" id="pinSend">KIRIM PIN</button>
+      <button class="btn" id="pinForget" ${savedPin?'':'disabled'}>LUPAKAN PIN</button>
+    </div>
+    <p class="hint">Status: ${connected ? (authed ? 'terhubung &amp; terbuka' : 'terhubung, TERKUNCI') : 'belum terhubung'}${savedPin?' &middot; PIN tersimpan di HP ini':''}.
+    PIN diatur lewat halaman WiFi alat (menu GLOBAL &rarr; WIFI / LOGO). Kosongkan/nonaktifkan PIN di sana bila tidak mau dipakai.</p>
+  </div>`;
+
+  const cv=document.getElementById('logoCanvas'), cx=cv.getContext('2d');
+  function draw(){
+    cx.fillStyle='#000'; cx.fillRect(0,0,LOGO_W,LOGO_H);
+    if(!logoImg) return;
+    const fill=document.getElementById('logoMode').value==='fill';
+    const sc=fill?Math.max(LOGO_W/logoImg.width,LOGO_H/logoImg.height):Math.min(LOGO_W/logoImg.width,LOGO_H/logoImg.height);
+    const w=logoImg.width*sc, h=logoImg.height*sc;
+    cx.imageSmoothingQuality='high';
+    cx.drawImage(logoImg,(LOGO_W-w)/2,(LOGO_H-h)/2,w,h);
+  }
+  draw();
+  document.getElementById('logoMode').onchange=draw;
+  document.getElementById('logoFile').onchange=(e)=>{
+    const f=e.target.files[0]; if(!f) return;
+    const u=URL.createObjectURL(f), im=new Image();
+    im.onload=()=>{ logoImg=im; draw(); URL.revokeObjectURL(u); };
+    im.src=u;
+  };
+
+  const stat=document.getElementById('logoStat'), bar=document.getElementById('logoBar');
+  document.getElementById('logoSend').onclick=async()=>{
+    if(!connected || !authed){ toast('Hubungkan & buka kunci PIN dulu'); return; }
+    if(!logoChar){ toast('Firmware alat belum mendukung ganti logo'); return; }
+    if(!logoImg){ toast('Pilih gambar dulu'); return; }
+    if(logoBusy) return;
+    logoBusy=true;
+    try{
+      draw();
+      const d=cx.getImageData(0,0,LOGO_W,LOGO_H).data, raw=new Uint8Array(LOGO_W*LOGO_H*2);
+      for(let i=0,j=0;i<d.length;i+=4,j+=2){
+        const v=((d[i]&0xF8)<<8)|((d[i+1]&0xFC)<<3)|(d[i+2]>>3);   // RGB565 little-endian
+        raw[j]=v&255; raw[j+1]=v>>8;
+      }
+      let sum=0; for(let i=0;i<raw.length;i++) sum+=raw[i]; sum&=0xFFFF;
+      await writeRaw(logoChar,[0x01],true);                        // START
+      const CH=100;
+      for(let off=0; off<raw.length; off+=CH){
+        const part=raw.subarray(off, Math.min(off+CH, raw.length));
+        await writeRaw(logoChar,[0x02, off&255, off>>8, ...part],true);   // DATA [off lo, off hi, bytes]
+        const pct=Math.round(Math.min(off+CH,raw.length)/raw.length*100);
+        bar.style.width=pct+'%'; stat.textContent='Mengirim '+pct+'%...';
+      }
+      await writeRaw(logoChar,[0x03, sum&255, sum>>8],true);       // COMMIT + checksum
+      stat.textContent='Terkirim. Alat menyimpan logo; lihat layar alat saat standby / nyalakan ulang.';
+      toast('Logo terkirim');
+    }catch(err){
+      stat.textContent='Gagal kirim: '+err.message; toast('Gagal kirim logo');
+    }
+    logoBusy=false;
+  };
+  document.getElementById('logoReset').onclick=async()=>{
+    if(!connected || !authed || !logoChar){ toast('Hubungkan & buka kunci PIN dulu'); return; }
+    try{ await writeRaw(logoChar,[0x04],true); toast('Logo kembali ke bawaan'); }catch(err){ toast('Gagal: '+err.message); }
+  };
+
+  document.getElementById('pinSend').onclick=async()=>{
+    const v=document.getElementById('pinInp').value.trim();
+    if(!/^\d{6}$/.test(v)){ toast('PIN harus 6 angka'); return; }
+    if(!connected){ localStorage.setItem('dlms_pin', v); toast('PIN disimpan, dipakai saat connect'); renderSettings(); return; }
+    const ok = await authenticate(v);
+    if(ok){ localStorage.setItem('dlms_pin', v); authed=true; updateConnUI(); toast('PIN benar, terbuka'); sendCmd(CMD.GET_ALL_STATUS,[]); renderSettings(); }
+    else toast('PIN salah atau terkunci 30 detik');
+  };
+  document.getElementById('pinForget').onclick=()=>{ localStorage.removeItem('dlms_pin'); toast('PIN dihapus dari HP'); renderSettings(); };
 }
 
 fillPresetQuickSel();
