@@ -164,10 +164,6 @@
     font-family:var(--mono); font-size:14px; padding:10px; border-radius:8px; user-select:text;}
   input.txt{letter-spacing:.3em; text-align:center;}
   .row2{display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px;}
-  .logoprev{background:#000; border-radius:8px; border:1px solid var(--line); padding:6px; margin-top:10px;}
-  .logoprev canvas{image-rendering:pixelated; border-radius:4px;}
-  .pbar{height:6px; background:#060a12; border-radius:4px; overflow:hidden; margin-top:10px; border:1px solid var(--line);}
-  .pbar i{display:block; height:100%; width:0; background:var(--cyan); transition:width .15s;}
   .modal{position:fixed; inset:0; background:rgba(4,7,12,.82); display:none; align-items:center; justify-content:center; z-index:80; padding:20px;}
   .modal.show{display:flex;}
   .modal .box{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; width:100%; max-width:340px;}
@@ -227,7 +223,6 @@ const SERVICE_UUID   = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const CHAR_CONTROL    = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
 const CHAR_STATUS     = 'beb5483e-36e1-4688-b7f5-ea07361b26a9';
 const CHAR_RTA        = 'beb5483e-36e1-4688-b7f5-ea07361b26aa';
-const CHAR_LOGO       = 'beb5483e-36e1-4688-b7f5-ea07361b26ab'; // ganti logo layar (firmware baru)
 const CMD_AUTH        = 0x20;   // [0x20, 6 digit PIN ASCII] - dipakai kalau PIN Bluetooth diaktifkan di alat
 
 const CMD = {
@@ -236,7 +231,7 @@ const CMD = {
   GET_ALL_STATUS:0x0B
 };
 
-let device=null, controlChar=null, logoChar=null, connected=false, authed=false, statusSeen=false, hasStatusChar=false;
+let device=null, controlChar=null, connected=false, authed=false, statusSeen=false, hasStatusChar=false;
 let activeCh = 0;
 let activeBand = 0;
 
@@ -309,7 +304,7 @@ async function connectBLE(){
     const server = await device.gatt.connect();
     const service = await server.getPrimaryService(SERVICE_UUID);
     controlChar = await service.getCharacteristic(CHAR_CONTROL);
-    logoChar = null; hasStatusChar = false; authed = false;
+    hasStatusChar = false; authed = false;
 
     try{
       const statusChar = await service.getCharacteristic(CHAR_STATUS);
@@ -323,8 +318,6 @@ async function connectBLE(){
       await rtaChar.startNotifications();
       rtaChar.addEventListener('characteristicvaluechanged', onRtaNotify);
     }catch(e){}
-
-    try{ logoChar = await service.getCharacteristic(CHAR_LOGO); }catch(e){ logoChar = null; }
 
     connected = true;
     updateConnUI();
@@ -350,7 +343,7 @@ async function connectBLE(){
     toast('Gagal connect: ' + e.message);
   }
 }
-function onDisconnected(){ connected=false; authed=false; logoChar=null; updateConnUI(); toast('Terputus dari board'); }
+function onDisconnected(){ connected=false; authed=false; sendQ.clear(); updateConnUI(); toast('Terputus dari board'); }
 function updateConnUI(){
   const btn=document.getElementById('connBtn');
   const lbl=document.getElementById('connLabel');
@@ -358,13 +351,29 @@ function updateConnUI(){
   lbl.textContent = connected ? (authed ? 'SYNCED' : 'LOCKED') : 'CONNECT';
 }
 
-async function sendCmd(cmd, payloadArr){
+// Antrean kirim: satu per satu (BLE tidak boleh menulis bersamaan) dan berurutan.
+// Perintah "live" dari slider memakai key yang sama -> yang menunggu di antrean diganti nilai terbaru,
+// jadi alat selalu mengikuti jari tanpa menumpuk paket.
+const sendQ = new Map(); let sendBusy = false, sendSeq = 0, sendFailToast = 0;
+async function flushSendQ(){
+  sendBusy = true;
+  while(sendQ.size){
+    const k = sendQ.keys().next().value, arr = sendQ.get(k); sendQ.delete(k);
+    if(!connected || !controlChar) { sendQ.clear(); break; }
+    try{ await writeRaw(controlChar, arr, false); }
+    catch(e){ if(Date.now()-sendFailToast>2000){ sendFailToast=Date.now(); toast('Gagal kirim data'); } }
+    await sleep(12);
+  }
+  sendBusy = false;
+}
+function enqueue(key, cmd, payloadArr){
   if(!connected || !controlChar){ toast('Belum terhubung ke board'); return; }
   if(!authed){ toast('Alat terkunci PIN — buka tab PENGATURAN'); return; }
-  const buf = new Uint8Array([cmd, ...payloadArr]);
-  try{ await controlChar.writeValueWithoutResponse(buf); }
-  catch(e){ try{ await controlChar.writeValue(buf); }catch(e2){ toast('Gagal kirim data'); } }
+  sendQ.set(key, [cmd, ...payloadArr]);
+  if(!sendBusy) flushSendQ();
 }
+function sendCmd(cmd, payloadArr){ enqueue('c'+(++sendSeq), cmd, payloadArr); }          // perintah biasa (berurutan)
+function sendLive(key, cmd, payloadArr){ enqueue('live:'+key, cmd, payloadArr); }          // slider: nilai terbaru saja
 function i16le(v){ const b=new ArrayBuffer(2); new DataView(b).setInt16(0,v,true); return Array.from(new Uint8Array(b)); }
 function u16le(v){ const b=new ArrayBuffer(2); new DataView(b).setUint16(0,v,true); return Array.from(new Uint8Array(b)); }
 
@@ -551,13 +560,22 @@ function renderXover(){
     sendCmd(CMD.SET_MUTE, [mask]); render(); renderOverviewCards();
   });
   const gs=document.getElementById('gainSlider');
-  gs.addEventListener('input', ()=> document.getElementById('gainVal').textContent = (gs.value>0?'+':'')+gs.value+'dB');
+  gs.addEventListener('input', ()=>{
+    document.getElementById('gainVal').textContent = (gs.value>0?'+':'')+gs.value+'dB';
+    state.gain[activeCh]=+gs.value; sendLive('gain'+activeCh, CMD.SET_GAIN,[activeCh,...i16le(+gs.value)]);
+  });
   gs.addEventListener('change', ()=>{ state.gain[activeCh]=+gs.value; sendCmd(CMD.SET_GAIN,[activeCh,...i16le(+gs.value)]); renderOverviewCards(); });
   const hs=document.getElementById('hpfSlider');
-  hs.addEventListener('input', ()=> document.getElementById('hpfVal').textContent = hs.value+'Hz');
+  hs.addEventListener('input', ()=>{
+    document.getElementById('hpfVal').textContent = hs.value+'Hz';
+    state.xoverHpf[activeCh]=+hs.value; sendLive('hpf'+activeCh, CMD.SET_XOVER_HPF,[activeCh,...i16le(+hs.value)]);
+  });
   hs.addEventListener('change', ()=>{ state.xoverHpf[activeCh]=+hs.value; sendCmd(CMD.SET_XOVER_HPF,[activeCh,...i16le(+hs.value)]); });
   const ls=document.getElementById('lpfSlider');
-  ls.addEventListener('input', ()=> document.getElementById('lpfVal').textContent = ls.value+'Hz');
+  ls.addEventListener('input', ()=>{
+    document.getElementById('lpfVal').textContent = ls.value+'Hz';
+    state.xoverLpf[activeCh]=+ls.value; sendLive('lpf'+activeCh, CMD.SET_XOVER_LPF,[activeCh,...i16le(+ls.value)]);
+  });
   ls.addEventListener('change', ()=>{ state.xoverLpf[activeCh]=+ls.value; sendCmd(CMD.SET_XOVER_LPF,[activeCh,...i16le(+ls.value)]); });
 }
 
@@ -585,16 +603,20 @@ function renderEq(){
     b.addEventListener('click', ()=>{ activeBand=+b.dataset.band; render(); });
   });
   const fs=document.getElementById('peqFreqSlider'), pgs=document.getElementById('peqGainSlider'), qs=document.getElementById('peqQSlider');
-  fs.addEventListener('input', ()=> document.getElementById('peqFreqVal').textContent = FREQ_ISO[+fs.value]+' Hz');
-  pgs.addEventListener('input', ()=>{
-    const v=+pgs.value; document.getElementById('peqGainVal').textContent=(v>0?'+':'')+v.toFixed(1)+' dB';
-    drawEqBars(v); // live preview: bar band aktif ikut gerak sebelum di-commit ke firmware
-  });
-  qs.addEventListener('input', ()=> document.getElementById('peqQVal').textContent = (+qs.value).toFixed(1));
-  function sendPeq(){
+  function peqPayload(){
     const freqIdx=+fs.value, gainX10=Math.round(+pgs.value*10), qX10=Math.round(+qs.value*10);
     state.peqFreqIdx[activeCh][activeBand]=freqIdx; state.peqGain[activeCh][activeBand]=gainX10; state.peqQ[activeCh][activeBand]=qX10;
-    sendCmd(CMD.SET_PEQ, [activeCh, activeBand, freqIdx, ...i16le(gainX10), ...u16le(qX10)]);
+    return [activeCh, activeBand, freqIdx, ...i16le(gainX10), ...u16le(qX10)];
+  }
+  function peqLive(){ sendLive('peq'+activeCh+'_'+activeBand, CMD.SET_PEQ, peqPayload()); }
+  fs.addEventListener('input', ()=>{ document.getElementById('peqFreqVal').textContent = FREQ_ISO[+fs.value]+' Hz'; peqLive(); drawEqBars(); });
+  pgs.addEventListener('input', ()=>{
+    const v=+pgs.value; document.getElementById('peqGainVal').textContent=(v>0?'+':'')+v.toFixed(1)+' dB';
+    peqLive(); drawEqBars(v);   // bar band aktif ikut gerak, alat ikut berubah saat digeser
+  });
+  qs.addEventListener('input', ()=>{ document.getElementById('peqQVal').textContent = (+qs.value).toFixed(1); peqLive(); });
+  function sendPeq(){
+    sendCmd(CMD.SET_PEQ, peqPayload());
     drawEqBars();
   }
   fs.addEventListener('change', sendPeq); pgs.addEventListener('change', sendPeq); qs.addEventListener('change', sendPeq);
@@ -643,7 +665,10 @@ function renderDelay(){
     </div>`;
   bindChSelector();
   const ds=document.getElementById('delaySlider');
-  ds.addEventListener('input', ()=> document.getElementById('delayVal').textContent = (+ds.value).toFixed(1)+' ms');
+  ds.addEventListener('input', ()=>{
+    document.getElementById('delayVal').textContent = (+ds.value).toFixed(1)+' ms';
+    state.delay[activeCh]=+ds.value; sendLive('delay'+activeCh, CMD.SET_DELAY, [activeCh, ...i16le(Math.round(+ds.value*10))]);
+  });
   ds.addEventListener('change', ()=>{
     state.delay[activeCh]=+ds.value;
     sendCmd(CMD.SET_DELAY, [activeCh, ...i16le(Math.round(+ds.value*10))]);
@@ -684,12 +709,16 @@ function renderComp(){
   ras.addEventListener('input', ()=>{ const v=+ras.value; document.getElementById('raVal').textContent = v>=50?'LIM':v.toFixed(1)+':1'; drawCompCurve(); });
   ats.addEventListener('input', ()=> document.getElementById('atVal').textContent = ats.value+' ms');
   rls.addEventListener('input', ()=> document.getElementById('rlVal').textContent = rls.value+' ms');
-  function sendLim(){
+  function limPayload(){
     state.limThresh[activeCh]=+ths.value; state.limRatio[activeCh]=+ras.value;
     state.limAttack[activeCh]=+ats.value; state.limRelease[activeCh]=+rls.value;
-    sendCmd(CMD.SET_LIMITER, [
-      activeCh, ...i16le(Math.round(+ths.value*10)), ...u16le(+ats.value), ...u16le(+rls.value), ...i16le(Math.round(+ras.value*10))
-    ]);
+    return [activeCh, ...i16le(Math.round(+ths.value*10)), ...u16le(+ats.value), ...u16le(+rls.value), ...i16le(Math.round(+ras.value*10))];
+  }
+  function limLive(){ sendLive('lim'+activeCh, CMD.SET_LIMITER, limPayload()); }
+  ths.addEventListener('input', limLive); ras.addEventListener('input', limLive);
+  ats.addEventListener('input', limLive); rls.addEventListener('input', limLive);
+  function sendLim(){
+    sendCmd(CMD.SET_LIMITER, limPayload());
     renderOverviewCards();
   }
   ths.addEventListener('change', sendLim); ras.addEventListener('change', sendLim);
@@ -795,25 +824,10 @@ function renderPreset(){
   });
 }
 
-/* ---------------- PENGATURAN: GANTI LOGO + PIN ---------------- */
-const LOGO_W=160, LOGO_H=128;
-let logoImg=null, logoBusy=false;
-
+/* ---------------- PENGATURAN: PIN BLUETOOTH ---------------- */
 function renderSettings(){
   const savedPin = !!localStorage.getItem('dlms_pin');
   main.innerHTML = `
-  <div class="panel"><h3>Ganti Logo Layar (Booting &amp; Standby)</h3>
-    <input type="file" id="logoFile" accept="image/*" class="sel">
-    <div style="height:8px"></div>
-    <select id="logoMode" class="sel"><option value="fit">PAS (UTUH, TEPI HITAM)</option><option value="fill">PENUH (TEPI DIPOTONG)</option></select>
-    <div class="logoprev"><canvas id="logoCanvas" width="${LOGO_W}" height="${LOGO_H}"></canvas></div>
-    <div class="pbar"><i id="logoBar"></i></div>
-    <div class="row2">
-      <button class="btn primary" id="logoSend">KIRIM KE ALAT</button>
-      <button class="btn" id="logoReset">LOGO BAWAAN</button>
-    </div>
-    <p class="hint" id="logoStat">Pilih gambar apa saja, otomatis diubah ke 160x128. Alat harus terhubung dan tidak terkunci PIN. Kirim butuh sekitar 15-30 detik; audio bisa putus sesaat saat logo disimpan ke flash.</p>
-  </div>
   <div class="panel"><h3>PIN Bluetooth</h3>
     <input class="txt" id="pinInp" type="password" inputmode="numeric" maxlength="6" placeholder="------" autocomplete="off">
     <div class="row2">
@@ -821,64 +835,8 @@ function renderSettings(){
       <button class="btn" id="pinForget" ${savedPin?'':'disabled'}>LUPAKAN PIN</button>
     </div>
     <p class="hint">Status: ${connected ? (authed ? 'terhubung &amp; terbuka' : 'terhubung, TERKUNCI') : 'belum terhubung'}${savedPin?' &middot; PIN tersimpan di HP ini':''}.
-    PIN diatur lewat halaman WiFi alat (menu GLOBAL &rarr; WIFI / LOGO). Kosongkan/nonaktifkan PIN di sana bila tidak mau dipakai.</p>
+    PIN, nama &amp; sandi WiFi, nama Bluetooth, dan ganti logo diatur lewat halaman WiFi alat: menu GLOBAL &rarr; WIFI / LOGO, nyalakan WiFi, lalu buka 192.168.4.1.</p>
   </div>`;
-
-  const cv=document.getElementById('logoCanvas'), cx=cv.getContext('2d');
-  function draw(){
-    cx.fillStyle='#000'; cx.fillRect(0,0,LOGO_W,LOGO_H);
-    if(!logoImg) return;
-    const fill=document.getElementById('logoMode').value==='fill';
-    const sc=fill?Math.max(LOGO_W/logoImg.width,LOGO_H/logoImg.height):Math.min(LOGO_W/logoImg.width,LOGO_H/logoImg.height);
-    const w=logoImg.width*sc, h=logoImg.height*sc;
-    cx.imageSmoothingQuality='high';
-    cx.drawImage(logoImg,(LOGO_W-w)/2,(LOGO_H-h)/2,w,h);
-  }
-  draw();
-  document.getElementById('logoMode').onchange=draw;
-  document.getElementById('logoFile').onchange=(e)=>{
-    const f=e.target.files[0]; if(!f) return;
-    const u=URL.createObjectURL(f), im=new Image();
-    im.onload=()=>{ logoImg=im; draw(); URL.revokeObjectURL(u); };
-    im.src=u;
-  };
-
-  const stat=document.getElementById('logoStat'), bar=document.getElementById('logoBar');
-  document.getElementById('logoSend').onclick=async()=>{
-    if(!connected || !authed){ toast('Hubungkan & buka kunci PIN dulu'); return; }
-    if(!logoChar){ toast('Firmware alat belum mendukung ganti logo'); return; }
-    if(!logoImg){ toast('Pilih gambar dulu'); return; }
-    if(logoBusy) return;
-    logoBusy=true;
-    try{
-      draw();
-      const d=cx.getImageData(0,0,LOGO_W,LOGO_H).data, raw=new Uint8Array(LOGO_W*LOGO_H*2);
-      for(let i=0,j=0;i<d.length;i+=4,j+=2){
-        const v=((d[i]&0xF8)<<8)|((d[i+1]&0xFC)<<3)|(d[i+2]>>3);   // RGB565 little-endian
-        raw[j]=v&255; raw[j+1]=v>>8;
-      }
-      let sum=0; for(let i=0;i<raw.length;i++) sum+=raw[i]; sum&=0xFFFF;
-      await writeRaw(logoChar,[0x01],true);                        // START
-      const CH=100;
-      for(let off=0; off<raw.length; off+=CH){
-        const part=raw.subarray(off, Math.min(off+CH, raw.length));
-        await writeRaw(logoChar,[0x02, off&255, off>>8, ...part],true);   // DATA [off lo, off hi, bytes]
-        const pct=Math.round(Math.min(off+CH,raw.length)/raw.length*100);
-        bar.style.width=pct+'%'; stat.textContent='Mengirim '+pct+'%...';
-      }
-      await writeRaw(logoChar,[0x03, sum&255, sum>>8],true);       // COMMIT + checksum
-      stat.textContent='Terkirim. Alat menyimpan logo; lihat layar alat saat standby / nyalakan ulang.';
-      toast('Logo terkirim');
-    }catch(err){
-      stat.textContent='Gagal kirim: '+err.message; toast('Gagal kirim logo');
-    }
-    logoBusy=false;
-  };
-  document.getElementById('logoReset').onclick=async()=>{
-    if(!connected || !authed || !logoChar){ toast('Hubungkan & buka kunci PIN dulu'); return; }
-    try{ await writeRaw(logoChar,[0x04],true); toast('Logo kembali ke bawaan'); }catch(err){ toast('Gagal: '+err.message); }
-  };
-
   document.getElementById('pinSend').onclick=async()=>{
     const v=document.getElementById('pinInp').value.trim();
     if(!/^\d{6}$/.test(v)){ toast('PIN harus 6 angka'); return; }
